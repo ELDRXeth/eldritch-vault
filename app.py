@@ -8,7 +8,7 @@ from collections import defaultdict
 # =========================================================
 st.set_page_config(page_title="Eldritch Org Vault", layout="wide")
 
-VERSION = "v0.4.1"
+VERSION = "v0.6.0-dev3"
 ACCESS_CODE = "Drake4Ever"
 
 # =========================================================
@@ -119,6 +119,16 @@ if not st.session_state.authenticated:
     st.stop()
 
 # =========================================================
+# ONE-TIME CONFIRMATION NOTIFICATIONS
+# =========================================================
+def queue_confirmation(message):
+    st.session_state["confirmation_message"] = message
+
+
+if "confirmation_message" in st.session_state:
+    st.toast(st.session_state.pop("confirmation_message"))
+
+# =========================================================
 # SUPABASE
 # =========================================================
 supabase = create_client(
@@ -132,20 +142,32 @@ supabase = create_client(
 def get_users():
     return supabase.table("members").select("*").execute().data or []
 
+
 def get_items():
     return supabase.table("items").select("*").execute().data or []
+
 
 def get_transactions():
     return supabase.table("transactions").select("*").order("created_at", desc=True).execute().data or []
 
+
+def get_currency_log():
+    return supabase.table("currency_log").select("*").order("created_at", desc=True).execute().data or []
+
+
 users = get_users()
 items = get_items()
 transactions = get_transactions()
+currency_log = get_currency_log()
 
 user_list = sorted([u["name"] for u in users], key=str.lower)
 item_list = sorted([i["name"] for i in items], key=str.lower)
 
-df = pd.DataFrame(transactions)
+item_df = pd.DataFrame(transactions)
+currency_df = pd.DataFrame(currency_log)
+
+# Preserve the existing variable name used by the inventory engine.
+df = item_df
 
 # =========================================================
 # INVENTORY ENGINE
@@ -176,12 +198,33 @@ def build_inventory(df):
 
     return inv
 
+
 inventory = build_inventory(df)
 
+
 def get_total_vault_items(inventory_dict):
-    return sum(max(0, qty) for qty in inventory_dict.values())
+    # Use the true net quantity so negative balances remain visible
+    # instead of being silently ignored.
+    return sum(inventory_dict.values())
+
+
+def get_auec_balance(currency_rows):
+    balance = 0
+
+    for row in currency_rows:
+        amount = int(row.get("amount") or 0)
+        action = row.get("action")
+
+        if action == "Deposit":
+            balance += amount
+        elif action == "Withdraw":
+            balance -= amount
+
+    return balance
+
 
 total_items_stored = get_total_vault_items(inventory)
+auec_balance = get_auec_balance(currency_log)
 
 # =========================================================
 # SIDEBAR VERSION
@@ -256,6 +299,7 @@ page = st.sidebar.radio(
         "Vault Entries",
         "Vault Storage",
         "Users",
+        "AUEC Vault",
         "Data Log"
     ]
 )
@@ -275,7 +319,7 @@ if page == "Vault Entries":
         if st.button("Add User", key="add_user_button"):
             if new_user.strip():
                 supabase.table("members").insert({"name": new_user.strip()}).execute()
-                st.success("User added")
+                queue_confirmation(f"User added: {new_user.strip()}")
                 st.rerun()
 
     with col2:
@@ -284,7 +328,7 @@ if page == "Vault Entries":
         if st.button("Add Item", key="add_item_button"):
             if new_item.strip():
                 supabase.table("items").insert({"name": new_item.strip().lower()}).execute()
-                st.success("Item added")
+                queue_confirmation(f"Item added: {new_item.strip().lower()}")
                 st.rerun()
 
     st.divider()
@@ -321,10 +365,37 @@ if page == "Vault Entries":
                     key="transfer_new_user"
                 )
 
+        item_description = st.text_area(
+            "Reason / Description (optional)",
+            key="item_transaction_description"
+        )
+
+        available_quantity = inventory.get((item, from_user), 0)
+        removes_inventory = action in ["Withdraw", "Transfer"]
+        exceeds_inventory = removes_inventory and qty > available_quantity
+        allow_item_overdraw = False
+
+        if exceeds_inventory:
+            shortage = qty - available_quantity
+            st.warning(
+                f"{from_user} currently holds {available_quantity} {item}, "
+                f"but this {action.lower()} requests {qty}. "
+                f"The resulting balance would be {-shortage}."
+            )
+            allow_item_overdraw = st.checkbox(
+                "Allow this transaction and create a negative inventory balance",
+                key="allow_item_overdraw"
+            )
+
         if st.button("Submit Transaction", key="submit_transaction_button"):
 
             if action == "Transfer" and not to_user.strip():
                 st.error("Transfer target cannot be empty.")
+            elif exceeds_inventory and not allow_item_overdraw:
+                st.error(
+                    "This transaction exceeds the available inventory. "
+                    "Enable the override checkbox to proceed."
+                )
             else:
                 if action == "Transfer":
                     existing_users = {
@@ -337,15 +408,27 @@ if page == "Vault Entries":
                             "name": to_user.strip()
                         }).execute()
 
+                cleaned_item_description = item_description.strip() or None
+
                 supabase.table("transactions").insert({
                     "item_name": item,
                     "quantity": qty,
                     "action": action,
                     "from_owner": from_user,
-                    "to_owner": to_user
+                    "to_owner": to_user,
+                    "notes": cleaned_item_description
                 }).execute()
 
-                st.success("Transaction recorded")
+                if action == "Deposit":
+                    confirmation = f"Deposited {qty} {item} for {from_user}"
+                elif action == "Withdraw":
+                    confirmation = f"Withdrew {qty} {item} from {from_user}"
+                else:
+                    confirmation = (
+                        f"Transferred {qty} {item} from {from_user} to {to_user.strip()}"
+                    )
+
+                queue_confirmation(confirmation)
                 st.rerun()
 
 # =========================================================
@@ -353,25 +436,43 @@ if page == "Vault Entries":
 # =========================================================
 elif page == "Vault Storage":
 
-    st.title("Vault Storage")
+    title_col, filter_col = st.columns([0.72, 0.28])
+
+    with title_col:
+        st.title("Vault Storage")
+
+    with filter_col:
+        show_nonpositive_items = st.checkbox(
+            "Show zero / negative balances",
+            value=False,
+            key="show_nonpositive_vault_items"
+        )
 
     if not inventory:
         st.info("No data available.")
     else:
         item_totals = defaultdict(list)
 
+        # Preserve every owner balance so audit mode can reveal zero and
+        # negative positions without changing the underlying ledger math.
         for (item, user), qty in inventory.items():
-            if qty > 0:
-                item_totals[item].append((user, qty))
+            item_totals[item].append((user, qty))
 
-        visible_items = {
-            item: owners
-            for item, owners in item_totals.items()
-            if sum(qty for _, qty in owners) > 0
-        }
+        visible_items = {}
+
+        for item, owners in item_totals.items():
+            net_total = sum(qty for _, qty in owners)
+
+            # Keep the normal vault view clean. Audit mode reveals items whose
+            # organization-wide balance is zero or negative.
+            if net_total > 0 or show_nonpositive_items:
+                visible_items[item] = owners
 
         if not visible_items:
-            st.info("No items currently stored.")
+            if show_nonpositive_items:
+                st.info("No item balances found.")
+            else:
+                st.info("No positively stocked items currently stored.")
         else:
             for item in sorted(visible_items.keys(), key=str.lower):
                 owners = sorted(
@@ -379,11 +480,20 @@ elif page == "Vault Storage":
                     key=lambda x: x[0].lower()
                 )
 
-                total_item = sum(qty for _, qty in owners)
+                net_total = sum(qty for _, qty in owners)
 
-                with st.expander(f"{item} ({total_item})"):
+                with st.expander(f"{item} ({net_total})"):
+                    displayed_owner = False
+
                     for user, qty in owners:
-                        st.write(f"{user}: {qty}")
+                        # In the normal view, zero owner rows add clutter. In
+                        # audit mode, show them alongside negative balances.
+                        if qty != 0 or show_nonpositive_items:
+                            st.write(f"{user}: {qty}")
+                            displayed_owner = True
+
+                    if not displayed_owner:
+                        st.info("All recorded user balances are zero.")
 
 # =========================================================
 # USERS
@@ -400,21 +510,110 @@ elif page == "Users":
             holdings = defaultdict(int)
 
             for (item, owner), qty in inventory.items():
-                if owner == user and qty > 0:
+                if owner == user and qty != 0:
                     holdings[item] += qty
 
             with st.expander(user):
-                positive_holdings = {
+                nonzero_holdings = {
                     item: qty
                     for item, qty in holdings.items()
-                    if qty > 0
+                    if qty != 0
                 }
 
-                if positive_holdings:
-                    for item in sorted(positive_holdings.keys(), key=str.lower):
-                        st.write(f"{item}: {positive_holdings[item]}")
+                if nonzero_holdings:
+                    for item in sorted(nonzero_holdings.keys(), key=str.lower):
+                        st.write(f"{item}: {nonzero_holdings[item]}")
                 else:
                     st.info("Empty")
+
+# =========================================================
+# AUEC VAULT
+# =========================================================
+elif page == "AUEC Vault":
+
+    st.title("AUEC Vault")
+
+    st.metric("Current Balance", f"{auec_balance:,.0f} aUEC")
+
+    st.divider()
+
+    currency_action = st.selectbox(
+        "Action",
+        ["Deposit", "Withdraw"],
+        key="currency_action"
+    )
+
+    currency_amount = st.number_input(
+        "Amount",
+        min_value=1,
+        step=1,
+        key="currency_amount"
+    )
+
+    currency_description = st.text_area(
+        "Reason / Description (optional)",
+        key="currency_description"
+    )
+
+    exceeds_auec_balance = (
+        currency_action == "Withdraw"
+        and currency_amount > auec_balance
+    )
+    allow_auec_overdraw = False
+
+    if exceeds_auec_balance:
+        shortage = int(currency_amount) - auec_balance
+        st.warning(
+            f"This withdrawal exceeds the current AUEC balance by "
+            f"{shortage:,.0f} aUEC. The resulting balance would be "
+            f"{auec_balance - int(currency_amount):,.0f} aUEC."
+        )
+        allow_auec_overdraw = st.checkbox(
+            "Allow this withdrawal and create a negative AUEC balance",
+            key="allow_auec_overdraw"
+        )
+
+    if st.button("Submit AUEC Entry", key="submit_currency_entry"):
+        if exceeds_auec_balance and not allow_auec_overdraw:
+            st.error(
+                "This withdrawal exceeds the current balance. "
+                "Enable the override checkbox to proceed."
+            )
+        else:
+            cleaned_currency_description = currency_description.strip() or None
+
+            supabase.table("currency_log").insert({
+                "action": currency_action,
+                "amount": int(currency_amount),
+                "description": cleaned_currency_description
+            }).execute()
+
+            queue_confirmation(
+                f"{currency_action} recorded: {int(currency_amount):,} aUEC"
+            )
+            st.rerun()
+
+    st.divider()
+    st.subheader("Recent Activity")
+
+    if currency_df.empty:
+        st.info("No AUEC entries found.")
+    else:
+        recent_currency_df = currency_df.copy().head(10)
+
+        if "amount" in recent_currency_df.columns:
+            recent_currency_df["amount"] = recent_currency_df["amount"].apply(
+                lambda amount: f"{int(amount):,}"
+            )
+
+        for column in ["id", "idx"]:
+            if column in recent_currency_df.columns:
+                recent_currency_df = recent_currency_df.drop(columns=[column])
+
+        st.dataframe(
+            recent_currency_df,
+            use_container_width=True
+        )
 
 # =========================================================
 # DATA LOG
@@ -423,23 +622,51 @@ elif page == "Data Log":
 
     st.title("Data Log")
 
-    if not df.empty:
-        display_df = df.copy()
+    item_log_tab, auec_log_tab = st.tabs(["Items", "AUEC"])
 
-        for column in [
-            "id",
-            "idx",
-            "user_name",
-            "notes",
-            "location"
-        ]:
-            if column in display_df.columns:
-                display_df = display_df.drop(columns=[column])
+    with item_log_tab:
+        if not item_df.empty:
+            display_item_df = item_df.copy()
 
-        st.dataframe(
-            display_df,
-            use_container_width=True
-        )
+            for column in [
+                "id",
+                "idx",
+                "user_name",
+                "location"
+            ]:
+                if column in display_item_df.columns:
+                    display_item_df = display_item_df.drop(columns=[column])
 
-    else:
-        st.info("No records found.")
+            if "notes" in display_item_df.columns:
+                display_item_df = display_item_df.rename(
+                    columns={"notes": "description"}
+                )
+
+            st.dataframe(
+                display_item_df,
+                use_container_width=True
+            )
+
+        else:
+            st.info("No item records found.")
+
+    with auec_log_tab:
+        if not currency_df.empty:
+            display_currency_df = currency_df.copy()
+
+            for column in ["id", "idx"]:
+                if column in display_currency_df.columns:
+                    display_currency_df = display_currency_df.drop(columns=[column])
+
+            if "amount" in display_currency_df.columns:
+                display_currency_df["amount"] = display_currency_df["amount"].apply(
+                    lambda amount: f"{int(amount):,}"
+                )
+
+            st.dataframe(
+                display_currency_df,
+                use_container_width=True
+            )
+
+        else:
+            st.info("No AUEC records found.")
